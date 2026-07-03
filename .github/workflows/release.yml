@@ -1,13 +1,15 @@
 name: Release on Version Update
 
+
 on:
   push:
     branches:
       - main
       - master
     paths:
-      - 'app/build.gradle.kts' # 只有当这个文件变动时才会检查并触发
-
+      - 'app/build.gradle.kts'
+  # 添加手动触发用于调试
+  workflow_dispatch:
 permissions:
   contents: write # 允许 GITHUB_TOKEN 创建 Release 和 Tag
 
