@@ -7,12 +7,8 @@ on:
       - master
     paths:
       - 'app/build.gradle.kts'
+  # 添加手动触发用于调试
   workflow_dispatch:
-    inputs:
-      force:
-        description: 'force run even if tag exists'
-        required: false
-        default: 'false'
 
 permissions:
   contents: write
@@ -20,10 +16,6 @@ permissions:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
-      ANDROID_HOME: ${{ runner.temp }}/android-sdk
-      JAVA_HOME: /opt/hostedtoolcache/jdk/17*/x64
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -33,67 +25,65 @@ jobs:
       - name: Check if Version Changed
         id: check_version
         run: |
-          echo "==== show build.gradle.kts ===="
-          sed -n '1,200p' app/build.gradle.kts || true
-
-          VERSION_NAME=$(grep -Eo 'versionName[[:space:]]*=[[:space:]]*\"[^\"]+\"' app/build.gradle.kts | head -n1 | awk -F'"' '{print $2}' || true)
+          # 改进的版本提取方式
+          VERSION_NAME=$(grep -o 'versionName\s*=\s*"[^"]*"' app/build.gradle.kts | head -1 | sed 's/versionName\s*=\s*"\([^"]*\)"/\1/')
           echo "当前代码中的 versionName: $VERSION_NAME"
-
+          
           if [ -z "$VERSION_NAME" ]; then
             echo "未能提取到 versionName，退出。"
-            echo "changed=false" >> $GITHUB_OUTPUT
-            exit 0
+            exit 1
           fi
-
+          
           TAG_NAME="v$VERSION_NAME"
-          echo "TAG_NAME=$TAG_NAME"
-
-          # 如果调用 workflow_dispatch 并传入 force=true，则强制发布
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            echo "force run requested"
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 检查 tag 是否已经存在
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          
+          # 检查对应的 tag 是否已经存在
           if git ls-remote --tags origin | grep -q "refs/tags/$TAG_NAME"; then
-            echo "Tag $TAG_NAME 已经存在，跳过发布。"
+            echo "Tag $TAG_NAME 已经存在，跳过后续操作。"
             echo "changed=false" >> $GITHUB_OUTPUT
-            exit 0
+          else
+            echo "检测到新版本，将构建并发布 $TAG_NAME。"
+            echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-          echo "检测到新版本，将构建并发布 $TAG_NAME。"
-          echo "changed=true" >> $GITHUB_OUTPUT
-          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+      - name: Debug - Show Version Info
+        if: always()
+        run: |
+          echo "Changed: ${{ steps.check_version.outputs.changed }}"
+          echo "Tag: ${{ steps.check_version.outputs.tag_name }}"
 
       - name: Generate Changelog
         if: steps.check_version.outputs.changed == 'true'
         id: changelog
         run: |
           PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
           if [ -z "$PREV_TAG" ]; then
             COMMITS=$(git log --no-merges --pretty=format:"%s")
           else
             COMMITS=$(git log $PREV_TAG..HEAD --no-merges --pretty=format:"%s")
           fi
-
+          
           echo "" > changelog.txt
+          
           FEATS=$(echo "$COMMITS" | grep "^feat:" | sed 's/^feat:[[:space:]]*/- /' || true)
           if [ -n "$FEATS" ]; then
             echo "## 功能" >> changelog.txt
             echo "$FEATS" >> changelog.txt
             echo "" >> changelog.txt
           fi
+          
           FIXES=$(echo "$COMMITS" | grep "^fix:" | sed 's/^fix:[[:space:]]*/- /' || true)
           if [ -n "$FIXES" ]; then
             echo "## 修复" >> changelog.txt
             echo "$FIXES" >> changelog.txt
             echo "" >> changelog.txt
           fi
+          
           if [ -z "$FEATS" ] && [ -z "$FIXES" ]; then
             echo "常规更新与优化" >> changelog.txt
           fi
+          
           cat changelog.txt
 
       - name: Setup Java
@@ -104,39 +94,6 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Install Android SDK command-line tools and packages
-        if: steps.check_version.outputs.changed == 'true'
-        run: |
-          set -e
-          SDK_ROOT=${ANDROID_SDK_ROOT}
-          mkdir -p $SDK_ROOT/cmdline-tools
-          cd $SDK_ROOT
-
-          # download commandlinetools
-          CMDLINE_ZIP=commandlinetools-linux-9477386_latest.zip
-          curl -fsSL https://dl.google.com/android/repository/${CMDLINE_ZIP} -o /tmp/${CMDLINE_ZIP}
-          unzip -q /tmp/${CMDLINE_ZIP} -d $SDK_ROOT/cmdline-tools
-          # move to conventional path
-          mkdir -p $SDK_ROOT/cmdline-tools/latest
-          mv $SDK_ROOT/cmdline-tools/cmdline-tools/* $SDK_ROOT/cmdline-tools/latest/ || true
-
-          export PATH=$PATH:$SDK_ROOT/cmdline-tools/latest/bin
-          export ANDROID_SDK_ROOT=$SDK_ROOT
-
-          yes | sdkmanager --licenses || true
-          sdkmanager --update
-          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;23.1.7779620" || true
-
-        shell: bash
-
-      - name: Set ANDROID env for later steps
-        if: steps.check_version.outputs.changed == 'true'
-        run: |
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
-          echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
-          echo "${ANDROID_SDK_ROOT}/platform-tools" >> $GITHUB_PATH
-          echo "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin" >> $GITHUB_PATH
-
       - name: Decode Keystore
         if: steps.check_version.outputs.changed == 'true'
         env:
@@ -146,17 +103,28 @@ jobs:
 
       - name: Build Release APK
         if: steps.check_version.outputs.changed == 'true'
-        id: build
         env:
-          KEYSTORE_FILE_PATH: $RUNNER_TEMP/keystore.jks
+          KEYSTORE_FILE_PATH: ${{ runner.temp }}/keystore.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
-          TAG: ${{ steps.check_version.outputs.tag }}
         run: |
-          set -e
           chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleRelease
+          
+          APK_DIR="app/build/outputs/apk/release"
+          find $APK_DIR -name "*.apk" -print0 | while IFS= read -r -d '' file; do
+            mv "$file" "$APK_DIR/LocationSpoofer-${{ steps.check_version.outputs.tag_name }}.apk"
+          done
 
-          # ensure SDK tools are in PATH
-          export PATH="$PATH:${ANDROID_SDK_ROOT}/platform-tools:${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin"
+      - name: Publish GitHub Release
+        if: steps.check_version.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check_version.outputs.tag_name }}
+          name: LocationSpoofer ${{ steps.check_version.outputs.tag_name }}
+          body_path: changelog.txt
+          files: app/build/outputs/apk/release/LocationSpoofer-*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
